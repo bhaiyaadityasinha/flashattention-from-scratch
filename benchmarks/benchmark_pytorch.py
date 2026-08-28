@@ -5,9 +5,6 @@ a hand-computed 4-element row for the online merge, plus a large-logit
 stress case that makes the unstable kernel overflow.
 """
 
-from __future__ import annotations
-
-import time
 from pathlib import Path
 
 import torch
@@ -15,8 +12,6 @@ from torch.utils.cpp_extension import load
 
 ROOT = Path(__file__).resolve().parents[1]
 KERNELS = ("naive", "stable", "online", "tiled")
-THREADS_NOTE = 256
-
 
 def build():
     include = str(ROOT / "kernels")
@@ -41,12 +36,21 @@ def build():
 def cuda_ms(fn, x, warmup=10, repeats=100):
     for _ in range(warmup):
         fn(x)
+
     torch.cuda.synchronize()
-    start = time.perf_counter()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+
     for _ in range(repeats):
         fn(x)
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) * 1e3 / repeats
+
+    end.record()
+    end.synchronize()
+
+    return start.elapsed_time(end) / repeats
 
 
 def max_abs_error(actual, reference):
