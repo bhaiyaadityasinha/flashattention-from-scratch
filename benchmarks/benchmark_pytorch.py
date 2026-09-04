@@ -1,4 +1,3 @@
-from __future__ import annotations
 from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
@@ -117,6 +116,7 @@ def benchmark(modules):
     ms = cuda_ms(torch.softmax, x, -1)
     gb = M * N * 8 / (ms * 1e-3) / 1e9
     print(f"{'torch':<12} {ms:8.3f} {gb:12.1f} {'reference':>12}")
+    print("\nBandwidth is modeled from theoretical access counts, not measured via Nsight.")
 
 
 def fused_test(tiled):
@@ -195,6 +195,8 @@ def fused_test(tiled):
 
         ms = cuda_ms(torch_path, q, k)
         print(f"{'unfused torch':<18} {ms:12.3f} {'reference':>12}")
+
+    print("\nFused-kernel GB/s figures are modeled from theoretical byte counts, not measured. They should not be used to infer the actual performance bottleneck without hardware profiling (e.g. Nsight Compute).")
 
 
 def main():
