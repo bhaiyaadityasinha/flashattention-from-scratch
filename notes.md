@@ -295,3 +295,44 @@ confidence of "outputs sum to 1" when merge forgot to rescale; link the
 matmul post; name FlashAttention as the reason both kernels belong in one
 portfolio; end with the fused kernel result and the synchronization diagnosis
 as a preview of what Flash Attention had to solve.
+
+---
+
+***(Added after initial push - reviewing the fused kernel analysis again)***
+
+**## Correction - fused kernel diagnosis**
+
+The original README blamed the fused kernel's slowdown mainly on synchronization. That came from comparing its modeled bandwidth (~1.1 GB/s) with the tiled softmax kernel (~192 GB/s) and concluding that synchronization was the bottleneck. That conclusion was too strong.
+
+**What was wrong.**
+
+A low modeled bandwidth does not tell us that a kernel is waiting on synchronization. A kernel can also show low GB/s simply because it is taking a long time to do inefficient work. To separate synchronization overhead from inefficient GEMM, I would need actual Nsight Compute stall data. I did not have that data.
+
+The synchronization count in the README was also wrong. For N=4096, there are 16 K-panels and 2 D-panels, with 2 synchronizations per `dot_k_tile` call. The function runs in both passes, giving:
+
+`16 x 2 x 2 x 2 = 128`
+
+barriers inside the two dot-product passes. There are also 10 more from Q loading and the block reduction, giving **138 total block-wide synchronizations**. The previous count of 64 missed the second pass and the other synchronizations.
+
+The L2 explanation was also overstated. At N=1024, the 4 MB score matrix can fit within the GPU's roughly 24 MB L2 cache capacity, which may reduce but does not guarantee elimination of DRAM traffic. Whether the data is actually served from L2 depends on the access pattern and cache activity, which was not measured.
+
+**What the benchmark actually shows.**
+
+The fused kernel is much slower: 36.2x at N=1024 and 46.9x at N=4096. These numbers come from the corrected comparison of full `Q @ K.T + softmax` against the fused kernel. An earlier benchmark compared the fused kernel against softmax alone, which was not a fair comparison.
+
+The main issue is more likely the way the GEMM is structured. Each thread computes one complete Q-K dot product against a K row, with very little reuse of K data between threads. This is much less efficient than a tiled GEMM where threads cooperate on tiles and reuse data from shared memory.
+
+The kernel also computes every score twice because of the two-pass design. The 138 synchronizations add overhead, but I have not isolated how much of the slowdown comes from synchronization versus the GEMM structure.
+
+**Lesson.**
+
+The ~1.1 GB/s number was useful for noticing that something was wrong, but it was not enough to identify the cause. I should not call synchronization the bottleneck without profiling data to support it.
+
+**Next steps.**
+
+* Run Nsight Compute and check the actual stall reasons.
+* Time the `dot_k_tile` GEMM work separately and compare it with PyTorch GEMM.
+* Make a test version with fewer synchronizations and see how much the runtime changes.
+
+That should give a better idea of where the time is actually going.
+
