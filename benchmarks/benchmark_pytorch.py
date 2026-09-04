@@ -1,161 +1,215 @@
-"""Build each CUDA kernel, check it against torch.softmax, then time it.
-
-Verification discipline matches the matmul work: many random elements, plus
-a hand-computed 4-element row for the online merge, plus a large-logit
-stress case that makes the unstable kernel overflow.
-"""
-
+from __future__ import annotations
 from pathlib import Path
-
 import torch
 from torch.utils.cpp_extension import load
 
 ROOT = Path(__file__).resolve().parents[1]
 KERNELS = ("naive", "stable", "online", "tiled")
+FLAGS = ["-O3", "--use_fast_math", "-Xcompiler=/Zc:preprocessor"]
+
+
+def load_kernel(name, source):
+    return load(name=name, sources=[str(source)],
+                extra_include_paths=[str(ROOT / "kernels")],
+                extra_cuda_cflags=FLAGS, verbose=False)
+
 
 def build():
-    include = str(ROOT / "kernels")
-    extra_cuda = [
-        "-O3",
-        "--use_fast_math",
-        "-Xcompiler=/Zc:preprocessor",
-    ]
-    modules = {}
-    for name in KERNELS:
-        source = ROOT / "kernels" / f"softmax_{name}.cu"
-        modules[name] = load(
-            name=f"cuda_softmax_{name}",
-            sources=[str(source)],
-            extra_include_paths=[include],
-            extra_cuda_cflags=extra_cuda,
-            verbose=False,
-        )
-    return modules
+    # Build each softmax kernel as a separate PyTorch extension.
+    return {n: load_kernel(f"cuda_softmax_{n}",
+            ROOT / "kernels" / f"softmax_{n}.cu") for n in KERNELS}
 
 
-def cuda_ms(fn, x, warmup=10, repeats=100):
+def build_fused():
+    return load_kernel("cuda_softmax_fused_matmul",
+                       ROOT / "kernels" / "softmax_fused_matmul.cu")
+
+
+def cuda_ms(fn, *args, warmup=10, repeats=100):
+    # Warm up first so initialization/JIT work is not included.
     for _ in range(warmup):
-        fn(x)
-
+        fn(*args)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-
     start.record()
 
     for _ in range(repeats):
-        fn(x)
+        fn(*args)
 
     end.record()
     end.synchronize()
-
     return start.elapsed_time(end) / repeats
 
 
-def max_abs_error(actual, reference):
-    if not torch.isfinite(actual).all():
-        n_bad = (~torch.isfinite(actual)).sum().item()
-        return float("inf"), n_bad
-    return torch.max((actual - reference).abs()).item(), 0
+def error(x, ref):
+    if not torch.isfinite(x).all():
+        return float("inf"), (~torch.isfinite(x)).sum().item()
+    return (x - ref).abs().max().item(), 0
 
 
-def check_many_elements(actual, reference, n_samples=4096):
-    """Compare thousands of random locations, not a handful of entries."""
-    flat_a = actual.reshape(-1)
-    flat_r = reference.reshape(-1)
-    n = flat_a.numel()
-    idx = torch.randint(0, n, (min(n_samples, n),), device=actual.device)
-    torch.testing.assert_close(flat_a[idx], flat_r[idx], rtol=1e-5, atol=1e-6)
+def check(x, ref, n=4096):
+    # Sample large tensors for the correctness check.
+    a, b = x.reshape(-1), ref.reshape(-1)
+    i = torch.randint(0, a.numel(), (min(n, a.numel()),), device=x.device)
+    torch.testing.assert_close(a[i], b[i], rtol=1e-5, atol=1e-6)
 
 
-def hand_example_online(module):
-    """Row [1, 2, 3, 0]: expected softmax can be computed by hand."""
-    x = torch.tensor([[1.0, 2.0, 3.0, 0.0]], device="cuda")
-    # max = 3, sum = e^{-2} + e^{-1} + 1 + e^{-3}
-    m = 3.0
-    d = sum(torch.exp(torch.tensor(v - m)) for v in (1.0, 2.0, 3.0, 0.0))
-    expected = torch.exp(x - m) / d
-    actual = module.softmax(x)
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+def hand():
+    x = torch.tensor([[1., 2., 3., 0.]], device="cuda")
+    m = x.max(-1, keepdim=True).values
+    y = torch.exp(x - m)
+    return x, y / y.sum(-1, keepdim=True)
+
+
+def test_standalone(modules):
+    x = torch.randn(512, 1024, device="cuda") * 4
+    ref = torch.softmax(x, -1)
+
+    print("Correctness: N(0, 4), 512 x 1024")
+    for n, mod in modules.items():
+        y = mod.softmax(x)
+        check(y, ref)
+        e, _ = error(y, ref)
+        print(f"  {n:<7} max |err| = {e:.3e}  OK")
+
+    # A small hand-check makes the expected values easy to verify.
+    x, ref = hand()
+    for n in ("online", "tiled"):
+        torch.testing.assert_close(
+            modules[n].softmax(x), ref, rtol=1e-6, atol=1e-6
+        )
+    print("Hand example [1, 2, 3, 0]: online/tiled OK")
+
+    # Large positive inputs expose overflow in naive softmax.
+    x = torch.randn(256, 2048, device="cuda") * 64 + 100
+    ref = torch.softmax(x, -1)
+
+    print("\nOverflow stress: N(100, 64), 256 x 2048")
+    print(f"  torch.softmax finite: {torch.isfinite(ref).all().item()}")
+
+    for n, mod in modules.items():
+        y = mod.softmax(x)
+        e, bad = error(y, ref)
+        print(f"  {n:<7} " +
+              ("finite: False" if bad else f"finite, max |err| = {e:.3e}"))
+
+
+def benchmark(modules):
+    M, N = 1024, 4096
+    x = torch.randn(M, N, device="cuda")
+    ref = torch.softmax(x, -1)
+
+    # Approximate global-memory traffic for each implementation.
+    traffic = {"naive": 3, "stable": 4, "online": 3, "tiled": 2}
+
+    print(f"\nBenchmark: {M} x {N} float32, 10 warmup + 100 runs")
+    print(f"{'kernel':<12} {'ms':>8} {'GB/s':>12} {'max |err|':>12}")
+
+    for n, mod in modules.items():
+        y = mod.softmax(x)
+        e, _ = error(y, ref)
+        ms = cuda_ms(mod.softmax, x)
+        gb = M * N * 4 * traffic[n] / (ms * 1e-3) / 1e9
+        print(f"{n:<12} {ms:8.3f} {gb:12.1f} {e:12.3e}")
+
+    ms = cuda_ms(torch.softmax, x, -1)
+    gb = M * N * 8 / (ms * 1e-3) / 1e9
+    print(f"{'torch':<12} {ms:8.3f} {gb:12.1f} {'reference':>12}")
+
+
+def fused_test(tiled):
+    fused = build_fused()
+
+    def ref(q, k):
+        return torch.softmax(q @ k.T, -1)
+
+    print("\n=== Fused matmul + softmax ===")
+    print("S = QK^T is kept in tiles; scores are recomputed for P.")
+
+    q = torch.randn(32, 64, device="cuda")
+    k = torch.randn(48, 64, device="cuda")
+    y, r = fused.fused_matmul_softmax(q, k), ref(q, k)
+    check(y, r)
+    e, _ = error(y, r)
+    print(f"Correctness Q 32x64, K 48x64: {e:.3e}  OK")
+
+    # Non-multiple dimensions test the boundary checks in the kernel.
+    q = torch.randn(17, 13, device="cuda")
+    k = torch.randn(19, 13, device="cuda")
+    check(fused.fused_matmul_softmax(q, k), ref(q, k))
+
+    q = torch.tensor([[1., 0.]], device="cuda")
+    k = torch.tensor([[1., 0.], [2., 0.], [3., 0.], [0., 0.]],
+                     device="cuda")
+    torch.testing.assert_close(
+        fused.fused_matmul_softmax(q, k), hand()[1],
+        rtol=1e-6, atol=1e-6
+    )
+    print("Edge 17x19 D=13 + hand example: OK")
+
+    # Large Q/K values produce large QK^T scores.
+    q = torch.randn(16, 32, device="cuda") * 4 + 20
+    k = torch.randn(64, 32, device="cuda") * 4 + 20
+    y, r = fused.fused_matmul_softmax(q, k), ref(q, k)
+    e, bad = error(y, r)
+    print(f"Overflow stress: fused finite {torch.isfinite(y).all().item()}, "
+          f"max |err| = {'inf/nan' if bad else f'{e:.3e}'}")
+
+    print("\nFused benchmark:")
+    print(f"{'Kernel':<18} {'Milliseconds':>12} "
+          f"{'GB/s':>12} {'Max Error':>12}")
+    print("-" * 58)
+
+    for M, N, D in ((1024, 1024, 64), (4096, 4096, 64)):
+        q = torch.randn(M, D, device="cuda")
+        k = torch.randn(N, D, device="cuda")
+        r = ref(q, k)
+
+        bq, bk, bs = M * D * 4, N * D * 4, M * N * 4
+
+        # Fused avoids writing the intermediate M x N score matrix.
+        fused_bytes = 2 * (bq + bk) + bs
+        unfused_bytes = bq + bk + 5 * bs
+
+        def ours(a, b):
+            return tiled.softmax(a @ b.T)
+
+        def torch_path(a, b):
+            return torch.softmax(a @ b.T, -1)
+
+        y = fused.fused_matmul_softmax(q, k)
+        e, bad = error(y, r)
+        ms = cuda_ms(fused.fused_matmul_softmax, q, k)
+        gb = fused_bytes / (ms * 1e-3) / 1e9
+        print(f"\n{M}x{D} @ {N}x{D}")
+        print(f"{'fused':<18} {ms:12.3f} {gb:12.1f} "
+              f"{'inf/nan' if bad else f'{e:.3e}':>12}")
+
+        y = ours(q, k)
+        e, _ = error(y, r)
+        ms = cuda_ms(ours, q, k)
+        gb = unfused_bytes / (ms * 1e-3) / 1e9
+        print(f"{'unfused tiled':<18} {ms:12.3f} {gb:12.1f} {e:12.3e}")
+
+        ms = cuda_ms(torch_path, q, k)
+        print(f"{'unfused torch':<18} {ms:12.3f} {'reference':>12}")
 
 
 def main():
     if not torch.cuda.is_available():
-        raise SystemExit("A CUDA-enabled PyTorch install is required.")
+        raise RuntimeError("CUDA GPU is required.")
 
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU: {props.name}")
-    print(f"SMs: {props.multi_processor_count}, mem: {props.total_memory / 1e9:.1f} GB")
-    print()
+    p = torch.cuda.get_device_properties(0)
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print(f"SMs: {p.multi_processor_count}, "
+          f"mem: {p.total_memory / 1e9:.1f} GB\n")
 
     modules = build()
-
-    # --- correctness: moderate random values (all kernels, including naive) ---
-    x_ok = torch.randn(512, 1024, device=device) * 2.0
-    ref_ok = torch.softmax(x_ok, dim=1)
-    print("Correctness on N(0, 4) inputs (512 x 1024), 4096 random samples:")
-    for name, module in modules.items():
-        actual = module.softmax(x_ok)
-        check_many_elements(actual, ref_ok)
-        err, _ = max_abs_error(actual, ref_ok)
-        print(f"  {name:<8} max |err| = {err:.3e}  OK")
-    print()
-
-    hand_example_online(modules["online"])
-    hand_example_online(modules["tiled"])
-    print("Hand example [1, 2, 3, 0]: online and tiled match closed form. OK")
-    print()
-
-    # --- overflow stress: values in the hundreds ---
-    x_big = torch.randn(256, 2048, device=device) * 8.0 + 100.0
-    ref_big = torch.softmax(x_big, dim=1)
-    naive_big = modules["naive"].softmax(x_big)
-    naive_finite = torch.isfinite(naive_big).all().item()
-    print("Overflow stress (values ~ N(100, 64), 256 x 2048):")
-    print(f"  torch.softmax finite: {torch.isfinite(ref_big).all().item()}")
-    print(f"  naive finite:         {naive_finite}  "
-          f"(False is expected — expf overflows above ~88.7)")
-    for name in ("stable", "online", "tiled"):
-        actual = modules[name].softmax(x_big)
-        check_many_elements(actual, ref_big)
-        err, _ = max_abs_error(actual, ref_big)
-        print(f"  {name:<8} finite, max |err| = {err:.3e}")
-    print()
-
-    # --- timing ---
-    rows, cols = 1024, 4096
-    x = torch.randn(rows, cols, device=device)
-    bytes_elem = x.numel() * x.element_size()
-    # Theoretical traffic (paper §2–3): naive 3, safe 4, online 3, tiled 2.
-    traffic = {
-        "naive": 3 * bytes_elem,
-        "stable": 4 * bytes_elem,
-        "online": 3 * bytes_elem,
-        "tiled": 2 * bytes_elem,
-        "torch": 3 * bytes_elem,  # typical fused safe+write, conservative
-    }
-
-    print(f"Benchmark: {rows} x {cols} float32, 10 warmup + 100 timed runs")
-    print(f"{'kernel':<10} {'ms':>8} {'GB/s (model)':>14} {'max |err|':>12}")
-    times = {}
-    for name, module in modules.items():
-        actual = module.softmax(x)
-        ref = torch.softmax(x, dim=1)
-        err, n_bad = max_abs_error(actual, ref)
-        ms = cuda_ms(module.softmax, x)
-        times[name] = ms
-        gbps = traffic[name] / (ms * 1e-3) / 1e9
-        err_s = "inf/nan" if n_bad else f"{err:.3e}"
-        print(f"{name:<10} {ms:8.3f} {gbps:14.1f} {err_s:>12}")
-
-    torch_ms = cuda_ms(lambda t: torch.softmax(t, dim=1), x)
-    print(f"{'torch':<10} {torch_ms:8.3f} {traffic['torch'] / (torch_ms * 1e-3) / 1e9:14.1f} {'reference':>12}")
-    print()
-    print("Bandwidth is modeled from the paper's access counts")
-    print("(safe=4, online/naive=3, tiled=2), not Nsight.")
+    test_standalone(modules)
+    benchmark(modules)
+    fused_test(modules["tiled"])
 
 
 if __name__ == "__main__":
