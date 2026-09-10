@@ -336,3 +336,78 @@ The ~1.1 GB/s number was useful for noticing that something was wrong, but it wa
 
 That should give a better idea of where the time is actually going.
 
+---
+
+*(Added after building flash_attention_fwd.cu and rewriting the README and a full report)*
+
+## FlashAttention kernel — raw benchmark variance across 5 sessions
+
+The report's numbers are means. Worth keeping the actual spread on record,
+since it's more informative than the mean alone for anyone deciding how
+much to trust a single run:
+
+Flash kernel, N=1024: 0.757, 0.757, 0.762, 0.761, 0.762 ms — tight, ~0.7%
+spread.
+
+Flash kernel, N=4096: 10.281, 10.281, 10.349, 10.354, 10.345 ms — also
+tight, ~0.7% spread.
+
+Naive fused, N=1024: 4.292, 4.292, 4.319, 4.321, 4.321 ms.
+
+Naive fused, N=4096: 67.444, 67.454, 67.859, 67.922, 67.861 ms.
+
+PyTorch SDPA, N=1024: 0.173, 0.173, 0.175, 0.174, 0.176 ms.
+
+PyTorch SDPA, N=4096: 2.247, 2.251, 2.255, 2.257, 2.264 ms.
+
+All three kernels show tight, consistent variance across sessions (under
+1%), which is notably tighter than the softmax-only benchmarks from
+earlier in the project. Worth a passing thought as to why — possibly
+because these runs are longer (more work per launch), so fixed overhead
+and OS scheduling noise are a smaller fraction of each measurement.
+
+## Overflow-stress error variance — flagged, not yet investigated
+
+The flash kernel's overflow-stress max error varies more across sessions
+than any other kernel in the project: 2.384e-07, 5.960e-07, 6.109e-07,
+6.706e-07, 4.113e-05, 1.769e-04, 2.189e-04, 3.689e-04, 4.1e-04 (values
+pulled from different runs across the whole flash-attention development
+period, not one clean 5-session set — worth rerunning as an actual
+controlled 5-session overflow test specifically, since these numbers
+were collected somewhat opportunistically while iterating on the kernel).
+
+Candidate causes, not yet checked: the single-thread 16 or 32-element
+softmax reduction inside the tile loop, run serially rather than with a
+tree reduction, may accumulate more rounding error under extreme inputs
+than the block-wide reductions used elsewhere. Alternatively, the `fmaf`
+accumulation order in the `flash_attention_32x32_d64` fast path's inner
+V-accumulation loop could compound differently than the general kernel's
+path. Neither has been checked. If picked back up, the right first step
+is isolating which of the two kernels (fast-path vs general) actually ran
+for each of the above numbers, since the benchmark dispatches by shape
+and the two kernels could plausibly have different numerical behavior
+under stress.
+
+## Repo/report naming — resolve before any more emails reference it
+
+Wrote a much longer, restructured README/report with a different implied
+repo folder name (`cuda-attention-kernels` vs the actual `cuda-softmax`
+used in every cold email link sent so far). Need to either rename the
+actual repo to match, or fix the report to use the real name — not both
+independently, or the two will drift. Whichever is chosen, grep the whole
+report for any other stray references to the old or new name before
+pushing, since a long document like this is easy to leave inconsistent
+in one missed spot.
+
+## Decision: TL;DR + tables as README, full report as REPORT.md
+
+The full 24-section document is closer to a technical report than a
+repo README — decided to split it: keep the TL;DR, the three results
+tables, repository layout, and build instructions as the actual
+README.md, and move sections 7 onward (the detailed diagnosis, kernel
+implementation walkthroughs, engineering lessons, next steps) into a
+separate REPORT.md, linked from the README. Reasoning: a professor
+clicking through from a cold email needs to verify claims in under a
+minute, not read a full report — but the report itself is genuinely
+good writing and shouldn't be cut, just relocated to where someone who
+wants the depth can find it.
