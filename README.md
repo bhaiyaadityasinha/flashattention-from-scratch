@@ -1,276 +1,249 @@
-# CUDA Softmax and Fused Attention
+# FlashAttention From Scratch
 
-A from-scratch CUDA implementation of several softmax algorithms and a fused `QK^T + softmax` kernel.
+A from-scratch CUDA implementation study of **FlashAttention-style exact attention**, covering numerical stability, memory traffic, tiling, data reuse, and GPU execution structure.
 
-The project starts with a basic softmax implementation and progressively adds numerical stability, online normalization, shared-memory tiling, and finally fusion with the matrix multiplication used in attention.
+> **This is a learning/research implementation, not a production replacement for FlashAttention.** The goal is to study the execution structure behind IO-aware attention through implementation, measurement, and failed experiments.
 
-The main goal is to measure the tradeoffs between global memory traffic, numerical stability, synchronization, and GPU data reuse.
+The project starts with standalone softmax kernels, explores a failed `QKᵀ + softmax` fusion, and culminates in a tiled FlashAttention-style forward pass that avoids materializing the full attention matrices in global memory.
 
-## Results
+> **Core finding:** reducing global-memory traffic alone is not enough. High-performance GPU kernels also require effective data reuse and an execution structure matched to the hardware.
 
-### Softmax
+## Results at a glance
 
-**GPU:** NVIDIA GeForce RTX 3050 6GB Laptop GPU, Ampere, sm_86, 20 SMs
-**Input:** 1024 x 4096 FP32
-**CUDA:** 13.0
-**PyTorch:** 2.13.0
+**NVIDIA RTX 3050 6GB Laptop · Ampere (`sm_86`) · FP32 · CUDA 13.0**
 
-Each result is the mean of 5 sessions. Every session uses 10 warmup runs followed by 100 timed runs. CUDA events are used for timing.
+### FlashAttention-style attention — `N × N`, `D=DV=64`
 
-| Kernel          | Method                       | Time (ms) | Modeled GB/s |
-| --------------- | ---------------------------- | --------: | -----------: |
-| Naive           | Unstable `exp(x)`            |     0.314 |        160.4 |
-| Stable          | Three-pass softmax           |     0.398 |        168.7 |
-| Online          | Online normalization         |     0.317 |        158.9 |
-| Tiled           | Shared memory + warp shuffle |     0.227 |        147.6 |
-| `torch.softmax` | PyTorch reference            |     0.221 |        152.0 |
+| Implementation           |       N=1024 |        N=4096 |
+| ------------------------ | -----------: | ------------: |
+| Unfused attention        |     4.309 ms |     67.708 ms |
+| **FlashAttention-style** | **0.760 ms** | **10.322 ms** |
+| PyTorch SDPA             |     0.174 ms |      2.255 ms |
 
-Modeled bandwidth is based on the theoretical global memory traffic of each implementation. Since the kernels use different numbers of global memory passes, the bandwidth values are not directly comparable. Wall time is the primary performance metric.
+The FlashAttention-style kernel is **5.7× faster** than the unfused attention baseline at `N=1024` and **6.6× faster** at `N=4096`.
 
-The online implementation is about 20% faster than the stable three-pass version. The tiled implementation is close to `torch.softmax`, with measured times of 0.227 ms and 0.221 ms respectively.
+The gap to PyTorch SDPA falls from roughly **25× → 4.4×** at `N=1024` and **30× → 4.6×** at `N=4096`.
 
-The naive implementation is faster than the stable version, but it is not numerically safe. An overflow test using values drawn from N(100, 64) produces non-finite results.
+These measurements demonstrate the effect of changing the execution structure and increasing cross-query reuse, but do **not** isolate the contribution of individual optimizations.
 
-### Fused Matmul + Softmax
+PyTorch SDPA selects its own native backend, so this is a **reference comparison rather than a controlled implementation-to-implementation comparison**. Its backend may use **Tensor Core/MMA-based matrix multiplication**, among other architecture-specific optimizations.
 
-The fused kernel computes:
+### Softmax — `1024 × 4096`
 
-```text
-softmax(Q @ K^T)
-```
+| Implementation |         Time |
+| -------------- | -----------: |
+| Naive          |     0.323 ms |
+| Stable         |     0.397 ms |
+| Online         |     0.316 ms |
+| **Tiled**      | **0.231 ms** |
+| PyTorch        |     0.227 ms |
 
-without writing the intermediate score matrix `S` to HBM.
+The tiled softmax kernel is within **1.8%** of `torch.softmax` on this workload. Online softmax is about **20% faster** than the stable three-pass implementation.
 
-| Kernel          | N=1024, D=64 | N=4096, D=64 |
-| --------------- | -----------: | -----------: |
-| Fused           |     4.268 ms |    67.149 ms |
-| Unfused tiled   |     0.118 ms |     1.432 ms |
-| Unfused PyTorch |     0.112 ms |     1.443 ms |
+## The FlashAttention-style kernel
 
-The fused implementation is currently much slower than both unfused versions.
-
-At N=1024 it is 36.2x slower than the unfused tiled implementation. At N=4096 it is 46.9x slower.
-
-This result shows that removing an intermediate tensor from HBM does not automatically make a fused kernel faster. The replacement computation also needs to maintain efficient GPU utilization and data reuse.
-
-## Fused Kernel
-
-The current fused implementation uses one block per query row.
-
-Q is loaded into shared memory and K is processed in tiles. The kernel makes two passes over K.
-
-**Pass 1**
-
-Each thread computes dot products and updates a running `(max, sum)` pair using the online softmax recurrence.
-
-**Pass 2**
-
-The dot products are recomputed and the normalized probabilities are written directly to the output.
-
-The score matrix is never stored in HBM.
-
-### Why It Is Currently Slow
-
-The main limitation is the matrix multiplication decomposition.
-
-A normal tiled GEMM loads tiles of Q and K into shared memory and reuses those values across many output elements. The current fused kernel instead assigns a complete query row to a block and computes dot products with much less reuse of K data.
-
-The kernel also computes every score twice. The first computation is needed for the softmax statistics and the second is needed to produce the final output.
-
-There is synchronization overhead as well. For N=4096, D=64, `THREADS=256`, and `TILE_D=32`, the kernel executes approximately 138 block-wide `__syncthreads()` calls per block.
-
-Of these, 128 come from the two dot-product passes:
+The final kernel computes:
 
 ```text
-16 K panels x 2 D panels x 2 synchronizations x 2 passes
+O = softmax(Q @ Kᵀ / √D) @ V
 ```
 
-The other 10 come from Q loading, the reduction setup, and the 8-step reduction across 256 threads.
+without materializing the **full score (`S`) or probability (`P`) matrices in global memory**.
 
-These barriers add overhead, but the current benchmark does not establish how much of the slowdown comes from synchronization versus the inefficient GEMM decomposition. Nsight Compute profiling would be needed to separate the two.
-
-At N=1024, the 4 MB score matrix can fit within the GPU's roughly 24 MB L2 cache capacity, which may reduce but does not guarantee elimination of DRAM traffic. At N=4096, the score matrix is 64 MB, so it exceeds the L2 cache capacity and the memory cost of materializing the matrix becomes much more significant.
-
-The next optimization is therefore to redesign the fused kernel around two-dimensional Q and K tiles. This would allow a loaded K tile to be reused across multiple query rows while keeping the online softmax computation.
-
-## Kernel Implementations
-
-### `softmax_naive.cu`
-
-Basic unstable softmax:
+It maintains the online softmax statistics and output accumulator across K/V tiles:
 
 ```text
-exp(x) / sum(exp(x))
+m' = max(m, max(S_tile))
+
+l' = exp(m - m') * l
+     + sum_j exp(S_j - m')
+
+O' = exp(m - m') * O
+     + sum_j exp(S_j - m') V_j
 ```
 
-No maximum is subtracted before evaluating the exponential. This makes it useful as a baseline and as a demonstration of floating-point overflow.
-
-### `softmax_stable.cu`
-
-Three-pass numerically stable softmax:
-
-1. Find the row maximum.
-2. Compute `sum(exp(x - max))`.
-3. Write the normalized output.
-
-Subtracting the maximum prevents exponential overflow.
-
-### `softmax_online.cu`
-
-Implements the online normalizer described by Milakov and Gimelshein.
-
-Each thread maintains a running `(max, sum)` pair. When a new maximum is encountered, the previous sum is rescaled using:
+The final output is:
 
 ```text
-exp(old_max - new_max)
+O / l
 ```
 
-Partial pairs are combined across the block using the same recurrence.
+### D=DV=64 fast path
 
-This reduces the statistics calculation to one global memory pass.
+The benchmarked fast path processes **32 query rows per block** and 32 K/V rows per tile:
 
-### `softmax_tiled.cu`
+```text
+Q tile:      32 × 64
+K tile:      32 × 64
+V tile:      32 × 64
+score tile:  32 × 32
+```
 
-Loads the entire row into shared memory once.
+Q, K, V, and the score tile reside in **shared memory**, while the **output accumulator remains in registers**.
 
-The reduction uses `__shfl_down_sync` through `warp_reduce_pair`, followed by a small cross-warp reduction.
+Each K/V tile is reused across multiple query rows. The 64-element Q·K dot product is computed directly in a thread rather than through a warp-level reduction.
 
-The output is generated from the shared-memory copy, avoiding another global memory read.
+A separate general FP32 kernel supports `1 <= D, DV <= 128`, subject to shared-memory limits.
 
-The implementation requires the row to fit within 48 KiB of shared memory.
+## The experiment that motivated the redesign
 
-### `softmax_fused_matmul.cu`
+Before the tiled attention kernel, I attempted to fuse:
 
-Computes `softmax(Q @ K^T)` without materializing the score matrix.
+```text
+softmax(Q @ Kᵀ)
+```
 
-The implementation uses tiled K loading, online softmax statistics, and a second pass to recompute the scores and write the output.
+into a single row-oriented kernel without writing the full score matrix to global memory.
 
-It is currently a correctness-focused implementation rather than a performance-optimized Flash Attention implementation.
+| Implementation        |   N=1024 |    N=4096 |
+| --------------------- | -------: | --------: |
+| Fused `QKᵀ + softmax` | 4.249 ms | 66.457 ms |
+| Unfused tiled         | 0.116 ms |  1.425 ms |
+| Unfused PyTorch       | 0.118 ms |  1.445 ms |
+
+The fused kernel was **36.6×** slower than the unfused tiled implementation at `N=1024` and **46.6×** slower at `N=4096`.
+
+The experiment showed that eliminating an intermediate global-memory write does not automatically make a kernel faster.
+
+The design used:
+
+* One block per query row.
+* Q in shared memory.
+* K processed in tiles.
+* Two passes over K.
+* Online softmax statistics.
+* Score recomputation.
+* No full score matrix written to global memory.
+
+However, it provided limited cross-query reuse of K data, recomputed every score, and introduced substantial synchronization. For `N=4096`, `D=64`, `THREADS=256`, and `TILE_D=32`, it executes approximately **138 `__syncthreads()` calls per block**.
+
+The benchmark does not establish whether synchronization or the matrix-multiplication decomposition is the dominant bottleneck; **Nsight Compute profiling has not yet been performed**.
+
+This negative result led to the final redesign around **tiled attention and cross-query K/V reuse**.
+
+## Why the PyTorch gap remains
+
+The FlashAttention-style implementation remains roughly **4.4–4.6× slower** than PyTorch SDPA.
+
+The benchmark does not establish a single cause. Potential contributors include:
+
+* Tensor Core / MMA-based computation.
+* Warp-specialized execution.
+* Asynchronous global-to-shared-memory pipelines.
+* Architecture-specific tile and thread mappings.
+* Register and shared-memory management.
+* Low-level scheduling and instruction-level optimization.
+
+The implementation has **not yet been profiled with Nsight Compute**. The next optimization cycle should therefore be hardware-guided rather than based on guessing at individual bottlenecks.
 
 ## Correctness
 
-The kernels are tested against PyTorch and several manually constructed cases.
+The kernels are tested against PyTorch using random inputs, non-multiple-of-tile dimensions, hand-constructed cases, and large-logit stress tests.
 
-### Random Inputs
+Standalone softmax tests typically produce maximum errors around **`1e-7`**.
 
-Softmax kernels are tested on 512 x 1024 inputs drawn from N(0, 4).
+For overflow stress using inputs drawn from `N(100, 64)`, the naive implementation produces non-finite values while the stable, online, and tiled implementations remain finite.
 
-4096 randomly selected output elements are compared against:
+For the FlashAttention-style large-logit stress test, the measured maximum error ranged from **`2.4e-7` to `4.1e-4`** across sessions. This is larger and more variable than the roughly `1e-7` errors observed for the standalone softmax kernels. The current tests do not isolate the source of this difference.
 
-```python
-torch.softmax(x, dim=-1)
-```
+## Softmax progression
 
-The maximum errors are within normal FP32 rounding error, around 1e-7.
+The attention kernel builds on several progressively optimized softmax implementations:
 
-### Hand-Checked Example
+* `softmax_naive.cu` — unstable baseline.
+* `softmax_stable.cu` — three-pass numerically stable softmax.
+* `softmax_online.cu` — online normalization.
+* `softmax_tiled.cu` — shared-memory + warp-shuffle softmax.
 
-The online and tiled implementations are tested using:
+These implementations provide the numerical-stability and reduction groundwork used when reasoning about the attention kernels.
 
-```text
-[1, 2, 3, 0]
-```
-
-The result is compared with a closed-form calculation independent of PyTorch.
-
-### Overflow Test
-
-Inputs of size 256 x 2048 are drawn from N(100, 64).
-
-The naive implementation produces non-finite values. Stable, online, and tiled implementations remain finite and match the PyTorch result.
-
-### Fused Kernel Tests
-
-The fused implementation is tested using:
-
-* Random Q and K, 32 x 48 with D=64.
-* 4096 sampled output elements compared against `torch.softmax(Q @ K.T)`.
-* Non-multiple-of-tile dimensions: 17 x 19 with D=13.
-* A hand-constructed case where `Q @ K^T = [1, 2, 3, 0]`.
-* Large Q and K values producing scores in the hundreds.
-
-The fused kernel produces finite, numerically correct results across these tests.
-
-## Repository Layout
+## Repository layout
 
 ```text
-cuda-softmax/
-|
-+-- kernels/
-|   +-- common.cuh
-|   +-- softmax_naive.cu
-|   +-- softmax_stable.cu
-|   +-- softmax_online.cu
-|   +-- softmax_tiled.cu
-|   +-- softmax_fused_matmul.cu
-|
-+-- benchmarks/
-|   +-- benchmark_pytorch.py
-|
-+-- requirements.txt
-+-- notes.md
-+-- README.md
+flashattention-from-scratch/
+├── kernels/
+│   ├── common.cuh
+│   ├── softmax_naive.cu
+│   ├── softmax_stable.cu
+│   ├── softmax_online.cu
+│   ├── softmax_tiled.cu
+│   ├── softmax_fused_matmul.cu
+│   └── flash_attention_fwd.cu
+├── benchmarks/
+│   └── benchmark_pytorch.py
+├── requirements.txt
+├── notes.md
+├── README.md
+└── REPORT.md
 ```
 
-### `kernels/common.cuh`
+### Attention kernel
 
-Shared definitions used by multiple kernels:
+`flash_attention_fwd.cu` implements the tiled FlashAttention-style forward pass:
 
-* `SoftmaxPair`
-* `merge_pair`
-* `warp_reduce_pair`
+```text
+O = softmax(Q @ Kᵀ / √D) @ V
+```
 
-### `kernels/softmax_naive.cu`
+The full `S` and `P` matrices are not materialized in global memory.
 
-Unstable softmax baseline.
+### Fusion experiment
 
-### `kernels/softmax_stable.cu`
+`softmax_fused_matmul.cu` contains the unsuccessful row-oriented fusion experiment that motivated the tiled redesign.
 
-Three-pass numerically stable softmax.
+## Benchmark methodology
 
-### `kernels/softmax_online.cu`
+* NVIDIA RTX 3050 6GB Laptop GPU
+* Ampere, `sm_86`
+* FP32
+* CUDA 13.0
+* PyTorch 2.13.0
+* 5 benchmark sessions
+* 10 warmup + 100 timed runs per session
+* CUDA events for timing
 
-Online softmax based on Milakov and Gimelshein.
+Softmax GB/s values are **modeled from theoretical global-memory traffic**, not measured DRAM bandwidth. Wall time is the primary performance metric.
 
-### `kernels/softmax_tiled.cu`
-
-Shared-memory and warp-shuffle implementation.
-
-### `kernels/softmax_fused_matmul.cu`
-
-Fused `softmax(Q @ K^T)` implementation that does not write the score matrix to HBM.
-
-### `benchmarks/benchmark_pytorch.py`
-
-Builds the CUDA extensions, checks correctness, runs the benchmarks, and compares the results with PyTorch.
-
-### `notes.md`
-
-Development notes containing bugs, implementation decisions, experiments, and benchmark history.
-
-## Build and Run
-
-The project requires PyTorch with CUDA support.
-
-The CUDA kernels are compiled automatically at runtime using `torch.utils.cpp_extension.load`, so no manual `nvcc` command is required.
+## Run
 
 ```bash
 pip install -r requirements.txt
 python benchmarks/benchmark_pytorch.py
 ```
 
-## Background
+CUDA extensions are compiled automatically through `torch.utils.cpp_extension.load`.
 
-The online softmax implementation follows the recurrence described in:
+## Research questions
 
-Milakov, M., & Gimelshein, N. (2018). *Online normalizer calculation for softmax*. arXiv:1805.02867.
+* How does data reuse affect GPU attention performance?
+* When does reducing global-memory traffic actually improve runtime?
+* How should online softmax be integrated with tiled matrix multiplication?
+* What execution structures make kernel fusion effective?
+* How much performance is left in a hand-written FP32 implementation without Tensor Core/MMA execution?
+* Which hardware-level changes matter most after the algorithmic structure is correct?
 
-The fused attention direction is motivated by:
+## Current status
 
-Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022). *FlashAttention: Fast and memory-efficient exact attention with IO-awareness*. NeurIPS 2022.
+The project now has a working **FlashAttention-style tiled forward pass** that substantially outperforms the original fused attention design on the tested workloads.
 
-## Next Steps
+Relative to the **unfused attention baseline**, the gap to PyTorch SDPA falls from roughly **25–30× to 4.4–4.6×**.
 
-The current fused implementation proves that the intermediate score matrix can be removed while maintaining numerical correctness.
+The next optimization cycle should begin with **Nsight Compute profiling** to identify the actual hardware bottlenecks before introducing lower-level optimizations such as:
 
-The main performance work is to change the QK computation from a row-oriented dot-product approach to a two-dimensional tiled GEMM. The goal is to increase reuse of Q and K data, reduce unnecessary global memory traffic, and make the fused computation closer to the structure used by Flash Attention.
+* Tensor Core / MMA-based dot products.
+* Warp-specialized producer/consumer execution.
+* Asynchronous global-to-shared-memory pipelines.
+* Architecture-specific tile and thread mappings.
+* Register and shared-memory optimization.
+* Additional shape-specialized kernels.
+
+The objective is not simply to reproduce a production attention kernel. It is to understand, through **implementation, measurement, failed experiments, and hardware-guided optimization**, why different GPU execution structures produce radically different performance for the same mathematical operation.
+
+## Detailed report
+
+See [`REPORT.md`](REPORT.md) for the full implementation discussion, synchronization analysis, correctness methodology, benchmark history, limitations, and optimization reasoning.
+
+## References
+
+* Milakov, M. & Gimelshein, N. (2018). *Online normalizer calculation for softmax*. arXiv:1805.02867.
+* Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. NeurIPS 2022.
