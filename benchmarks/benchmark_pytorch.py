@@ -24,6 +24,11 @@ def build_fused():
                        ROOT / "kernels" / "softmax_fused_matmul.cu")
 
 
+def build_flash():
+    return load_kernel("cuda_flash_attention_fwd",
+                       ROOT / "kernels" / "flash_attention_fwd.cu")
+
+
 def cuda_ms(fn, *args, warmup=10, repeats=100):
     # Warm up first so initialization/JIT work is not included.
     for _ in range(warmup):
@@ -199,6 +204,81 @@ def fused_test(tiled):
     print("\nFused-kernel GB/s figures are modeled from theoretical byte counts, not measured. They should not be used to infer the actual performance bottleneck without hardware profiling (e.g. Nsight Compute).")
 
 
+def flash_attention_test():
+    """Validate and time O = softmax(QK^T / sqrt(D)) V fairly.
+
+    The naive fused baseline below deliberately materialises P because the
+    original fused kernel ends at softmax(QK^T).  It is therefore a fair
+    end-to-end attention baseline, not a comparison against softmax alone.
+    """
+    flash = build_flash()
+
+    def ref(q, k, v, causal=False):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q[None, None], k[None, None], v[None, None], is_causal=causal
+        )[0, 0]
+
+    def naive_attention(q, k, v):
+        # fused_matmul_softmax has no scaling argument, so scale Q first.
+        p = fused.fused_matmul_softmax(q / (q.size(1) ** 0.5), k)
+        return p @ v
+
+    fused = build_fused()
+    print("\n=== FlashAttention forward: O = softmax(QK^T / sqrt(D)) V ===")
+    print("Neither S nor P is written by the FlashAttention kernel.")
+
+    q = torch.randn(32, 64, device="cuda")
+    k = torch.randn(48, 64, device="cuda")
+    v = torch.randn(48, 64, device="cuda")
+    y, r = flash.flash_attention_fwd(q, k, v), ref(q, k, v)
+    check(y, r)
+    e, _ = error(y, r)
+    print(f"Random Q 32x64, K/V 48x64: {e:.3e}  OK")
+
+    # Non-tile dimensions and a closed-form-friendly one-hot query exercise
+    # bounds and the online recurrence independently of the random test.
+    q = torch.tensor([[1., 0.]], device="cuda")
+    k = torch.tensor([[1., 0.], [2., 0.], [3., 0.], [0., 0.]], device="cuda")
+    v = torch.tensor([[1., 0.], [0., 1.], [2., 1.], [-1., 3.]], device="cuda")
+    torch.testing.assert_close(flash.flash_attention_fwd(q, k, v), ref(q, k, v),
+                               rtol=1e-6, atol=1e-6)
+    q = torch.randn(17, 13, device="cuda")
+    k = torch.randn(19, 13, device="cuda")
+    v = torch.randn(19, 11, device="cuda")
+    check(flash.flash_attention_fwd(q, k, v), ref(q, k, v))
+    print("Hand example + non-multiple 17x19 (D=13, DV=11): OK")
+
+    q = torch.randn(16, 32, device="cuda") * 4 + 20
+    k = torch.randn(64, 32, device="cuda") * 4 + 20
+    v = torch.randn(64, 32, device="cuda")
+    y, r = flash.flash_attention_fwd(q, k, v), ref(q, k, v)
+    e, bad = error(y, r)
+    print(f"Overflow stress: flash finite {torch.isfinite(y).all().item()}, "
+          f"max |err| = {'inf/nan' if bad else f'{e:.3e}'}")
+
+    print("\nEnd-to-end attention benchmark (10 warmup + 100 runs):")
+    print(f"{'Problem':<20} {'naive fused':>14} {'flash':>12} {'PyTorch SDPA':>15}")
+    print("-" * 66)
+    for M, N, D in ((1024, 1024, 64), (4096, 4096, 64)):
+        q = torch.randn(M, D, device="cuda")
+        k = torch.randn(N, D, device="cuda")
+        v = torch.randn(N, D, device="cuda")
+        r = ref(q, k, v)
+
+        y = flash.flash_attention_fwd(q, k, v)
+        check(y, r)
+        e, _ = error(y, r)
+        naive_ms = cuda_ms(naive_attention, q, k, v)
+        flash_ms = cuda_ms(flash.flash_attention_fwd, q, k, v)
+        sdpa_ms = cuda_ms(ref, q, k, v)
+        print(f"{M}x{D} @ {N}x{D:<4} {naive_ms:14.3f} {flash_ms:12.3f} "
+              f"{sdpa_ms:15.3f}  (flash err {e:.3e})")
+
+    print("\nThe naive-fused column is fused softmax(QK^T) followed by P@V; it materialises P.")
+    print("SDPA selects PyTorch's native backend. Compare wall time, but use Nsight Compute "
+          "to attribute performance to synchronization, reuse, or memory stalls.")
+
+
 def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required.")
@@ -212,6 +292,7 @@ def main():
     test_standalone(modules)
     benchmark(modules)
     fused_test(modules["tiled"])
+    flash_attention_test()
 
 
 if __name__ == "__main__":
